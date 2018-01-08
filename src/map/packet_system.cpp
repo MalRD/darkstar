@@ -2129,6 +2129,71 @@ void SmallPacket0x04D(map_session_data_t* session, CCharEntity* PChar, CBasicPac
     return;
 }
 
+void LoadAuctionHistory(CCharEntity* PChar)
+{
+    PChar->m_ah_history.clear();
+
+    // A single SQL query for the player's AH history which is stored in a Char Entity struct + vector.
+    const char* Query = "SELECT itemid, price, stack, date FROM auction_house WHERE seller = %u ORDER BY id ASC LIMIT 7;";
+
+    int32 ret = Sql_Query(SqlHandle, Query, PChar->id);
+
+    if (ret != SQL_ERROR && Sql_NumRows(SqlHandle) != 0)
+    {
+        while (Sql_NextRow(SqlHandle) == SQL_SUCCESS)
+        {
+            AuctionHistory_t ah;
+            ah.itemid = (uint16)Sql_GetIntData(SqlHandle, 0);
+            ah.price = (uint32)Sql_GetUIntData(SqlHandle, 1);
+            ah.stack = (uint8)Sql_GetIntData(SqlHandle, 2);
+            ah.status = 0;
+            PChar->m_ah_history.push_back(ah);
+        }
+    }
+    ShowDebug("%s has %i items up on the AH. \n", PChar->GetName(), PChar->m_ah_history.size());
+}
+
+uint32 CalculateAuctionFee(uint32 price, bool isSingle)
+{
+    uint32 auctionFee = 0;
+    if (isSingle)
+    {
+        auctionFee = (uint32)(map_config.ah_base_fee_single + (price * map_config.ah_tax_rate_single / 100));
+    }
+    else
+    {
+        auctionFee = (uint32)(map_config.ah_base_fee_stacks + (price * map_config.ah_tax_rate_stacks / 100));
+    }
+    return std::clamp<uint32>(auctionFee, 0, map_config.ah_max_fee);
+}
+
+// charutils::SendInventory does this same send. Perhaps this could be a
+// function of charutils called by this and that.
+void SendInventoryAssignEquip(CCharEntity* PChar)
+{
+    for (int32 i = 0; i < 16; ++i)
+    {
+        CItem* PItem = PChar->getEquip((SLOTTYPE)i);
+        if (PItem != nullptr)
+        {
+            PItem->setSubType(ITEM_LOCKED);
+            PChar->pushPacket(new CInventoryAssignPacket(PItem, INV_NODROP));
+        }
+    }
+}
+
+// This functionality is also performed in 0x111 zone transition. 
+void SendEquip(CCharEntity* PChar)
+{
+    for (uint8 i = 0; i < 16; ++i)
+    {
+        if (PChar->equip[i] != 0)
+        {
+            PChar->pushPacket(new CEquipPacket(PChar->equip[i], i, PChar->equipLoc[i]));
+        }
+    }
+}
+
 /************************************************************************
 *                                                                       *
 *  Auction House                                                        *
@@ -2165,8 +2230,10 @@ void SmallPacket0x04E(map_session_data_t* session, CCharEntity* PChar, CBasicPac
             !(PItem->isSubType(ITEM_LOCKED)) &&
             !(PItem->getFlag() & ITEM_FLAG_NOAUCTION))
         {
+            bool isSingle = quantity == 1;
+            auto fee = CalculateAuctionFee(price, isSingle);
             PItem->setCharPrice(price); // not sure setCharPrice is right
-            PChar->pushPacket(new CAuctionHousePacket(action, PItem, quantity, price));
+            PChar->pushPacket(new CAuctionHousePacket(PItem, fee, isSingle));
         }
     }
     break;
@@ -2176,106 +2243,131 @@ void SmallPacket0x04E(map_session_data_t* session, CCharEntity* PChar, CBasicPac
 
         if (curTick - PChar->m_AHHistoryTimestamp > 5000)
         {
-            PChar->m_ah_history.clear();
             PChar->m_AHHistoryTimestamp = curTick;
+            LoadAuctionHistory(PChar);
             PChar->pushPacket(new CAuctionHousePacket(action));
-
-            // A single SQL query for the player's AH history which is stored in a Char Entity struct + vector.
-            const char* Query = "SELECT itemid, price, stack FROM auction_house WHERE seller = %u and sale=0 ORDER BY id ASC LIMIT 7;";
-
-            int32 ret = Sql_Query(SqlHandle, Query, PChar->id);
-
-            if (ret != SQL_ERROR && Sql_NumRows(SqlHandle) != 0)
-            {
-                while (Sql_NextRow(SqlHandle) == SQL_SUCCESS)
-                {
-                    AuctionHistory_t ah;
-                    ah.itemid = (uint16)Sql_GetIntData(SqlHandle, 0);
-                    ah.price = (uint32)Sql_GetUIntData(SqlHandle, 1);
-                    ah.stack = (uint8)Sql_GetIntData(SqlHandle, 2);
-                    ah.status = 0;
-                    PChar->m_ah_history.push_back(ah);
-                }
-            }
-            ShowDebug("%s has %i items up on the AH. \n", PChar->GetName(), PChar->m_ah_history.size());
         }
         else
         {
+            // Wasn't able to reproduce this message on retail performing Sales
+            // Status requests back-to-back. Was it patched out of the game or
+            // does it only occur in certain scenarios (heavy load)?
             PChar->pushPacket(new CAuctionHousePacket(action, 246, 0, 0)); // try again in a little while msg
             break;
         }
     }
     case 0x0A:
     {
-        auto totalItemsOnAh = PChar->m_ah_history.size();
-
-        for (size_t slot = 0; slot < totalItemsOnAh; slot++)
+        LoadAuctionHistory(PChar);
+        for (size_t slot = 0; slot < 8; slot++)
         {
-            PChar->pushPacket(new CAuctionHousePacket(0x0C, (uint8)slot, PChar));
+            PChar->pushPacket(new CAuctionHousePacket(action, (uint8)slot, PChar));
         }
     }
     break;
     case 0x0B:
     {
         CItem* PItem = PChar->getStorage(LOC_INVENTORY)->GetItem(slot);
-
-        if ((PItem != nullptr) &&
-            !(PItem->isSubType(ITEM_LOCKED)) &&
-            !(PItem->getFlag() & ITEM_FLAG_NOAUCTION))
+        if (PItem == nullptr)
         {
-            uint32 auctionFee = 0;
-            if (quantity == 0)
-            {
-                if (PItem->getStackSize() == 1 || PItem->getStackSize() != PItem->getQuantity())
-                {
-                    ShowError(CL_RED"SmallPacket0x04E::AuctionHouse: Incorrect quantity of item %s\n" CL_RESET, PItem->getName());
-                    PChar->pushPacket(new CAuctionHousePacket(action, 197, 0, 0)); // Failed to place up
-                    return;
-                }
-                auctionFee = (uint32)(map_config.ah_base_fee_stacks + (price * map_config.ah_tax_rate_stacks / 100));
-            }
-            else
-            {
-                auctionFee = (uint32)(map_config.ah_base_fee_single + (price * map_config.ah_tax_rate_single / 100));
-            }
-
-            auctionFee = std::clamp<uint32>(auctionFee, 0, map_config.ah_max_fee);
-
-            if (PChar->getStorage(LOC_INVENTORY)->GetItem(0)->getQuantity() < auctionFee)
-            {
-                // ShowDebug(CL_CYAN"%s Can't afford the AH fee\n" CL_RESET,PChar->GetName());
-                PChar->pushPacket(new CAuctionHousePacket(action, 197, 0, 0)); // Not enough gil to pay fee
-                return;
-            }
-
-            if (PChar->m_ah_history.size() >= 7)
-            {
-                // ShowDebug(CL_CYAN"%s already has 7 items on the AH\n" CL_RESET,PChar->GetName());
-                PChar->pushPacket(new CAuctionHousePacket(action, 197, 0, 0)); // Failed to place up
-                return;
-            }
-
-            const char* fmtQuery = "INSERT INTO auction_house(itemid, stack, seller, seller_name, date, price) VALUES(%u,%u,%u,'%s',%u,%u)";
-
-            if (Sql_Query(SqlHandle,
-                fmtQuery,
-                PItem->getID(),
-                quantity == 0,
-                PChar->id,
-                PChar->GetName(),
-                (uint32)time(nullptr),
-                price) == SQL_ERROR)
-            {
-                ShowError(CL_RED"SmallPacket0x04E::AuctionHouse: Cannot insert item %s to database\n" CL_RESET, PItem->getName());
-                PChar->pushPacket(new CAuctionHousePacket(action, 197, 0, 0)); //failed to place up
-                return;
-            }
-            charutils::UpdateItem(PChar, LOC_INVENTORY, slot, -(int32)(quantity != 0 ? 1 : PItem->getStackSize()));
-            charutils::UpdateItem(PChar, LOC_INVENTORY, 0, -(int32)auctionFee); // Deduct AH fee
-
-            PChar->pushPacket(new CAuctionHousePacket(action, 1, 0, 0)); // Merchandise put up on auction msg
-            PChar->pushPacket(new CAuctionHousePacket(0x0C, (uint8)PChar->m_ah_history.size(), PChar)); // Inform history of slot
+            PChar->pushPacket(new CAuctionHousePacket(action, 197, 0, 0));
+            return;
         }
+
+        if (PItem->isSubType(ITEM_LOCKED) ||
+            PItem->getFlag() & ITEM_FLAG_NOAUCTION ||
+            (PItem->isSubType(ITEM_CHARGED) && ((CItemUsable*)PItem)->getCurrentCharges() < ((CItemUsable*)PItem)->getMaxCharges()))
+        {
+            PChar->pushPacket(new CAuctionHousePacket(action, 197, 0, 0));
+            return;
+        }
+
+        auto isSingle = PItem->getStackSize() == 1;
+        auto auctionFee = CalculateAuctionFee(price, isSingle);
+        if (PChar->getStorage(LOC_INVENTORY)->GetItem(0)->getQuantity() < auctionFee)
+        {
+            PChar->pushPacket(new CAuctionHousePacket(action, 197, 0, 0));
+            return;
+        }
+
+        LoadAuctionHistory(PChar);
+        if (PChar->m_ah_history.size() >= 7)
+        {
+            PChar->pushPacket(new CAuctionHousePacket(action, 197, 0, 0));
+            return;
+        }
+
+        const char* fmtQuery = "INSERT INTO auction_house(itemid, stack, seller, seller_name, date, price) VALUES(%u,%u,%u,'%s',%u,%u)";
+        if (Sql_Query(SqlHandle,
+            fmtQuery,
+            PItem->getID(),
+            quantity == 0,
+            PChar->id,
+            PChar->GetName(),
+            (uint32)time(nullptr),
+            price) == SQL_ERROR)
+        {
+            ShowError(CL_RED"SmallPacket0x04E::AuctionHouse: Cannot insert item %s to database\n" CL_RESET, PItem->getName());
+            PChar->pushPacket(new CAuctionHousePacket(action, 197, 0, 0)); //failed to place up
+            return;
+        }
+
+        uint8 ahSlot = (uint8)PChar->m_ah_history.size();
+        AuctionHistory_t ah;
+        ah.itemid = PItem->getID();
+        ah.price = price;
+        ah.stack = quantity == 0;
+        ah.status = 0;
+        PChar->m_ah_history.push_back(ah);
+
+        // Proper retail packet response
+        // [x] 0x051 Character appearance
+        // [x] 0x04C 0x06 is set to 0x02
+        // [x] 0x01E 0x04 contains current gil amount
+        // [x] 0x01E 0x09 set to slot ID for item being sold
+        // [x] 0x01F 1 per equipped item. Triggered by model change functionality?
+        // [x] 0x01E 0x08 set to 0x01 (bag ID?) Triggered by apperance change functionality?
+        // [x] 0x01E 0x08 set to 0x09 (bag ID?) Triggered by apperance change functionality?
+        // [x] 0x01D finish inventory
+        // [x] 0x050 1 per equipped item. Triggered by apperance change functionality?
+        // [x] 0x04F Bookend for 0x51?
+
+        // [x] 0x051 Model change
+        // [x] 0x04C 0x06 is set to 0x01
+        // [x] 0x01F New money amount
+        // [x] 0x01F 1 per equipped item (split by 0x050). Triggered by apperance change functionality?
+        // [x] 0x050 1 per equipped item. Same as the first 0x50 packets
+        // [x] 0x01F 1 per equipped item (split by 0x050). Same as first 0x01F set.
+        // [x] 0x01E 0x08 set to 0x01
+        // [x] 0x01E 0x08 set to 0x09
+        // [x] 0x01D finish inventory
+
+        PChar->pushPacket(new CCharAppearancePacket(PChar));
+        PChar->pushPacket(new CAuctionHousePacket(action, 0x02, PChar, ahSlot, true));
+        PChar->pushPacket(new CInventoryModifyPacket(0, 0, PChar->getStorage(LOC_INVENTORY)->GetItem(0)->getQuantity()));
+        PChar->pushPacket(new CInventoryModifyPacket(0, PItem->getSlotID(), 0));
+        SendInventoryAssignEquip(PChar);
+        PChar->pushPacket(new CInventoryModifyPacket(LOC_MOGSAFE, 0, 0));
+        PChar->pushPacket(new CInventoryModifyPacket(LOC_MOGSAFE2, 0, 0));
+        PChar->pushPacket(new CInventoryFinishPacket());
+        SendEquip(PChar);
+        PChar->pushPacket(new CDownloadingDataPacket());
+
+        charutils::UpdateItem(PChar, LOC_INVENTORY, slot, -(int32)(quantity != 0 ? 1 : PItem->getStackSize()), false, true);
+        charutils::UpdateItem(PChar, LOC_INVENTORY, 0, -(int32)auctionFee, false, true); // Deduct AH fee
+
+        PChar->pushPacket(new CCharAppearancePacket(PChar));
+        PChar->pushPacket(new CAuctionHousePacket(action, 0x01, PChar, ahSlot, true));
+        PChar->pushPacket(new CInventoryAssignPacket(PChar->getStorage(LOC_INVENTORY)->GetItem(0), 0));
+        SendInventoryAssignEquip(PChar);
+        SendEquip(PChar);
+        PChar->pushPacket(new CInventoryModifyPacket(LOC_MOGSAFE, 0, 0));
+        PChar->pushPacket(new CInventoryModifyPacket(LOC_MOGSAFE2, 0, 0));
+        PChar->pushPacket(new CInventoryFinishPacket());
+
+        // This appears to be buffered and isn't always sent until right before
+        // the next 0x51 packet is triggered. Hard to tell.
+        PChar->pushPacket(new CDownloadingDataPacket());
     }
     break;
     case 0x0E:
@@ -2285,57 +2377,60 @@ void SmallPacket0x04E(map_session_data_t* session, CCharEntity* PChar, CBasicPac
         if (PChar->getStorage(LOC_INVENTORY)->GetFreeSlotsCount() == 0)
         {
             PChar->pushPacket(new CAuctionHousePacket(action, 0xE5, 0, 0));
+            return;
         }
-        else
+
+        CItem* PItem = itemutils::GetItemPointer(itemid);
+        if (PItem == nullptr)
         {
-            CItem* PItem = itemutils::GetItemPointer(itemid);
+            // Someone else can try pushing an invalid item ID at retail.
+            return;
+        }
 
-            if (PItem != nullptr)
+        if (PItem->getFlag() & ITEM_FLAG_RARE)
+        {
+            for (uint8 LocID = 0; LocID < MAX_CONTAINER_ID; ++LocID)
             {
-                if (PItem->getFlag() & ITEM_FLAG_RARE)
+                if (PChar->getStorage(LocID)->SearchItem(itemid) != ERROR_SLOTID)
                 {
-                    for (uint8 LocID = 0; LocID < MAX_CONTAINER_ID; ++LocID)
-                    {
-                        if (PChar->getStorage(LocID)->SearchItem(itemid) != ERROR_SLOTID)
-                        {
-                            PChar->pushPacket(new CAuctionHousePacket(action, 0xE5, 0, 0));
-                            return;
-                        }
-                    }
-                }
-                CItem* gil = PChar->getStorage(LOC_INVENTORY)->GetItem(0);
-
-                if (gil != nullptr &&
-                    gil->isType(ITEM_CURRENCY) &&
-                    gil->getQuantity() >= price)
-                {
-                    const char* fmtQuery = "UPDATE auction_house SET buyer_name = '%s', sale = %u, sell_date = %u WHERE itemid = %u AND buyer_name IS NULL AND stack = %u AND price <= %u ORDER BY price LIMIT 1";
-
-                    if (Sql_Query(SqlHandle,
-                        fmtQuery,
-                        PChar->GetName(),
-                        price,
-                        (uint32)time(nullptr),
-                        itemid,
-                        quantity == 0,
-                        price) != SQL_ERROR &&
-                        Sql_AffectedRows(SqlHandle) != 0)
-                    {
-                        uint8 SlotID = charutils::AddItem(PChar, LOC_INVENTORY, itemid, (quantity == 0 ? PItem->getStackSize() : 1));
-
-                        if (SlotID != ERROR_SLOTID)
-                        {
-                            charutils::UpdateItem(PChar, LOC_INVENTORY, 0, -(int32)(price));
-
-                            PChar->pushPacket(new CAuctionHousePacket(action, 0x01, itemid, price));
-                            PChar->pushPacket(new CInventoryFinishPacket());
-                        }
-                        return;
-                    }
+                    PChar->pushPacket(new CAuctionHousePacket(action, 0xE5, 0, 0));
+                    return;
                 }
             }
-            PChar->pushPacket(new CAuctionHousePacket(action, 0xC5, itemid, price));
         }
+
+        CItem* gil = PChar->getStorage(LOC_INVENTORY)->GetItem(0);
+        if (gil == nullptr ||
+            !gil->isType(ITEM_CURRENCY) ||
+            gil->getQuantity() < price)
+        {
+            return;
+        }
+
+        const char* fmtQuery = "UPDATE auction_house SET buyer_name = '%s', sale = %u, sell_date = %u WHERE itemid = %u AND buyer_name IS NULL AND stack = %u AND price <= %u ORDER BY price LIMIT 1";
+        if (Sql_Query(SqlHandle,
+            fmtQuery,
+            PChar->GetName(),
+            price,
+            (uint32)time(nullptr),
+            itemid,
+            quantity == 0,
+            price) != SQL_ERROR &&
+            Sql_AffectedRows(SqlHandle) != 0)
+        {
+
+            uint8 SlotID = charutils::AddItem(PChar, LOC_INVENTORY, itemid, (quantity == 0 ? PItem->getStackSize() : 1), true);
+
+            if (SlotID != ERROR_SLOTID)
+            {
+                charutils::UpdateItem(PChar, LOC_INVENTORY, 0, -(int32)(price));
+
+                PChar->pushPacket(new CAuctionHousePacket(action, 0x01, itemid, price));
+                PChar->pushPacket(new CInventoryFinishPacket());
+            }
+            return;
+        }
+        PChar->pushPacket(new CAuctionHousePacket(action, 0xC5, itemid, price));
     }
     break;
     case 0x0C: // Removing item from AH
@@ -2359,7 +2454,8 @@ void SmallPacket0x04E(map_session_data_t* session, CCharEntity* PChar, CBasicPac
                         if (SlotID != ERROR_SLOTID)
                         {
                             Sql_TransactionCommit(SqlHandle);
-                            PChar->pushPacket(new CAuctionHousePacket(action, 0, PChar, slotid, false));
+                            PChar->pushPacket(new CAuctionHousePacket(action, 0x02, PChar, slotid, true));
+                            PChar->pushPacket(new CAuctionHousePacket(action, 0x01, PChar, slotid, false));
                             PChar->pushPacket(new CInventoryFinishPacket());
                             Sql_SetAutoCommit(SqlHandle, isAutoCommitOn);
                             return;
@@ -2379,7 +2475,12 @@ void SmallPacket0x04E(map_session_data_t* session, CCharEntity* PChar, CBasicPac
     break;
     case 0x0D:
     {
-        PChar->pushPacket(new CAuctionHousePacket(action, slotid, PChar));
+        // When send on retail servers, each for sale item receives an
+        // 0x0D 0x02 packet, then each receives an 0x0D 0x01 packet. DSP will
+        // send the packets by slot id. Unsure how to replicate that with DSP's
+        // packet system. 
+        PChar->pushPacket(new CAuctionHousePacket(action, 0x02, PChar, slotid, true));
+        PChar->pushPacket(new CAuctionHousePacket(action, 0x01, PChar, slotid, true));
     }
     break;
     }

@@ -93,7 +93,7 @@ CAuctionHousePacket::CAuctionHousePacket(uint8 action, uint8 slot, CCharEntity* 
     if (slot < 7 && slot < PChar->m_ah_history.size())
     {
         ref<uint8>(0x14) = 0x03;
-        ref<uint8>(0x16) = 0x01;                                   // Value is changed, the purpose is unknown UNKNOWN
+        ref<uint8>(0x16) = 0x01; // Inventory slot ID when item placed on auction
 
         ref<uint16>(0x28) = PChar->m_ah_history.at(slot).itemid;    // Item ID of item in slot
         ref<uint8>(0x2A) = 1 - PChar->m_ah_history.at(slot).stack; // Number of items stack size
@@ -128,7 +128,7 @@ CAuctionHousePacket::CAuctionHousePacket(uint8 action, uint8 message, CCharEntit
     if (keepItem && slot < 7 && slot < PChar->m_ah_history.size())
     {
         ref<uint8>(0x14) = 0x03;
-        ref<uint8>(0x16) = 0x01; // Value is changed, the purpose is unknown UNKNOWN
+        ref<uint8>(0x16) = 0x01; // Inventory slot ID when item placed on auction
 
         memcpy(data+(0x18), PChar->GetName(), std::clamp<size_t>(strlen((const char*)PChar->GetName()), 0, 16));
 
@@ -139,4 +139,27 @@ CAuctionHousePacket::CAuctionHousePacket(uint8 action, uint8 message, CCharEntit
 
         ref<uint8>(0x30) = AUCTION_ID;
     }
+}
+
+// Response to 0x04E packtet with action 0x04
+// This packet informs the client of the price to perform a transaction, if the
+// character item validation checks have passed.
+CAuctionHousePacket::CAuctionHousePacket(CItem* PItem, uint32 auctionFee, bool isSingle)
+{
+    this->type = 0x4C;
+    this->size = 0x1E;
+
+    ref<uint8>(0x04) = 0x04;
+    ref<uint8>(0x05) = 0xFF;
+    ref<uint8>(0x06) = IsAuctionOpen;
+    ref<uint8>(0x07) = 0x02;            // Retail returns 0x04 here in tests.
+    ref<uint32>(0x08) = auctionFee;
+
+    ref<uint8>(0x0C) = PItem->getSlotID();
+    ref<uint32>(0x0E) = PItem->getID();
+    
+    ref<uint8>(0x10) = isSingle;
+
+    // Retail doesn't set the auction ID in this case.
+    // ref<uint8>(0x30) = AUCTION_ID;
 }

@@ -1346,14 +1346,15 @@ namespace charutils
     *                                                                       *
     ************************************************************************/
 
-    uint32 UpdateItem(CCharEntity* PChar, uint8 LocationID, uint8 slotID, int32 quantity, bool force)
+    uint32 UpdateItem(CCharEntity* PChar, uint8 LocationID, uint8 slotID, int32 quantity, bool force, bool silent)
     {
         CItem* PItem = PChar->getStorage(LocationID)->GetItem(slotID);
 
         if (PItem == nullptr)
         {
             ShowDebug("UpdateItem: No item in slot %u\n", slotID);
-            PChar->pushPacket(new CInventoryItemPacket(nullptr, LocationID, slotID));
+            if (!silent)
+                PChar->pushPacket(new CInventoryItemPacket(nullptr, LocationID, slotID));
             return 0;
         }
         if ((int32)PItem->getQuantity() + quantity < 0)
@@ -1386,7 +1387,8 @@ namespace charutils
             if (Sql_Query(SqlHandle, Query, newQuantity, PChar->id, LocationID, slotID) != SQL_ERROR)
             {
                 PItem->setQuantity(newQuantity);
-                PChar->pushPacket(new CInventoryModifyPacket(LocationID, slotID, newQuantity));
+                if (!silent)
+                    PChar->pushPacket(new CInventoryModifyPacket(LocationID, slotID, newQuantity));
             }
         }
         else if (newQuantity == 0)
@@ -1396,7 +1398,8 @@ namespace charutils
             if (Sql_Query(SqlHandle, Query, PChar->id, LocationID, slotID) != SQL_ERROR)
             {
                 PChar->getStorage(LocationID)->InsertItem(nullptr, slotID);
-                PChar->pushPacket(new CInventoryItemPacket(nullptr, LocationID, slotID));
+                if (!silent)
+                    PChar->pushPacket(new CInventoryItemPacket(nullptr, LocationID, slotID));
 
                 if (PChar->getStyleLocked() && !HasItem(PChar, ItemID))
                 {
@@ -1429,6 +1432,11 @@ namespace charutils
             }
         }
         return ItemID;
+    }
+
+    uint32 UpdateItem(CCharEntity* PChar, uint8 LocationID, uint8 slotID, int32 quantity, bool force)
+    {
+        return charutils::UpdateItem(PChar, LocationID, slotID, quantity, force, false);
     }
 
     /************************************************************************
